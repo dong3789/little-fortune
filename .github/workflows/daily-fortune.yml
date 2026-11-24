@@ -1,0 +1,95 @@
+# 매일 자동 수집 (Daily fortune)
+#
+# 담당자 컴퓨터를 켜지 않아도 매일 아침 운세가 수집되도록, GitHub Actions가
+# scripts/scrape_daily.py를 실행해 데이터 파일 3개만 커밋합니다.
+# 사이트 소스가 레포에 없어서 빌드를 다시 할 수 없지만, 두 페이지 모두
+# 데이터를 브라우저에서 fetch({cache: "no-store"})로 읽어오기 때문에
+# 데이터 파일만 갱신해도 사이트에 바로 반영됩니다. (자세한 내용은
+# scripts/README.md 참고)
+#
+# 스케줄 (KST 기준):
+# - 06:30: 인스타그램(@sinbi_saju) 포스트는 00:00 KST, 아사히 JSON은
+#   아침 방송 이후에 올라오므로 06:30에 수집합니다.
+# - 08:30: 첫 실행 때 아직 안 올라온 경우를 위한 백업 실행.
+#   스크립트가 이미 수집된 날짜는 건너뛰므로 중복 커밋이 없습니다.
+
+name: Daily fortune
+
+on:
+  schedule:
+    - cron: "30 21 * * *" # 06:30 KST
+    - cron: "30 23 * * *" # 08:30 KST (backup)
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "수집할 날짜 (YYYY-MM-DD, KST). 비우면 오늘"
+        required: false
+        default: ""
+      fortune_shortcode:
+        description: "인스타그램 자동 탐색이 실패했을 때 직접 지정할 shortcode (예: DgFpujpjEQE)"
+        required: false
+        default: ""
+      wait_minutes:
+        description: "오늘 운세가 올라올 때까지 기다릴 시간(분)"
+        required: false
+        default: "120"
+
+# Actions 봇이 데이터 파일을 커밋하려면 쓰기 권한이 필요합니다.
+# 레포 Settings > Actions > General > Workflow permissions에서
+# "Read and write permissions"가 켜져 있어야 합니다.
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-fortune
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect today's fortunes
+        id: scrape
+        continue-on-error: true
+        env:
+          TARGET_DATE: ${{ inputs.date }}
+          FORTUNE_SHORTCODE: ${{ inputs.fortune_shortcode }}
+          WAIT_MINUTES: ${{ inputs.wait_minutes || '120' }}
+        run: |
+          ARGS="--wait-minutes ${WAIT_MINUTES}"
+          [ -n "${TARGET_DATE}" ] && ARGS="${ARGS} --date ${TARGET_DATE}"
+          [ -n "${FORTUNE_SHORTCODE}" ] && ARGS="${ARGS} --fortune-shortcode ${FORTUNE_SHORTCODE}"
+          python3 scripts/scrape_daily.py ${ARGS}
+
+      # 한쪽만 수집돼도 그 부분은 커밋합니다 (예: 띠별 운세는 됐는데
+      # 별자리 운세가 아직 안 올라온 경우). 다음 스케줄 실행이 나머지를
+      # 채웁니다.
+      - name: Commit collected data
+        if: always()
+        env:
+          TARGET_DATE: ${{ inputs.date }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fortune-index.json horoscope-editions.json fortunes/
+          if git diff --cached --quiet; then
+            echo "No new data to commit."
+          else
+            DATE_KST="${TARGET_DATE:-$(TZ=Asia/Seoul date +%F)}"
+            git commit -m "Daily fortune: ${DATE_KST}" -m "Collected by scripts/scrape_daily.py (scheduled run)."
+            git push
+          fi
+
+      - name: Fail the run if collection did not finish
+        if: steps.scrape.outcome == 'failure'
+        run: |
+          echo "::error::수집이 끝나지 않았습니다. 로그에서 어느 쪽(인스타그램/아사히)이 안 올라왔는지 확인하세요."
+          echo "수동 재실행: Actions > Daily fortune > Run workflow (date 입력 가능)"
+          exit 1
