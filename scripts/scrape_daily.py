@@ -28,13 +28,17 @@ Translation notes (read scripts/README.md for the full story):
 - Lucky items (``lucky``) come from ``glossary.json`` first. It was
   built by aligning the 12 existing human-translated editions with the
   original Japanese, so recurring items keep the site's own wording.
-  Unknown items fall back to Google Translate (direct ja -> ko).
-- Summaries are translated with Google Translate via an English pivot
-  (ja -> en -> ko). Direct ja -> ko mangled this colloquial horoscope
-  Japanese ("チャンスが舞い込む" -> "기회가 춤춘다"), while the pivot
-  stays close to the human translations. It is still machine
-  translation: the Japanese original is kept in ``ja_summary`` /
+  Unknown items fall back to machine translation (direct ja -> ko).
+- Summaries are translated with DeepL when a DEEPL_API_KEY is configured
+  (direct ja -> ko, one call), otherwise with Google Translate via an
+  English pivot (ja -> en -> ko). Direct ja -> ko on Google mangled this
+  colloquial horoscope Japanese ("チャンスが舞い込む" -> "기회가 춤춘다"),
+  while the pivot stays close to the human translations. It is still
+  machine translation: the Japanese original is kept in ``ja_summary`` /
   ``ja_lucky`` so any awkward line can be traced and fixed by hand.
+  The keyless Google endpoint rate-limits shared IPs (HTTP 429) — that
+  is what killed the 2026-11-25 run — so the Google path retries with
+  exponential backoff, and DeepL (authenticated) is recommended.
 
 Exit codes: 0 = collected (or already up to date), 1 = hard error,
 2 = today's data not published yet (after waiting).
@@ -47,6 +51,7 @@ import datetime as dt
 import html as htmlmod
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -118,8 +123,52 @@ def http_get(url: str, timeout: int = 25, user_agent: str | None = None) -> byte
 
 
 # --------------------------------------------------------------------------
-# Translation (Google Translate web endpoint, no key needed)
+# Translation
+#
+# Primary (recommended): DeepL free API, via the DEEPL_API_KEY environment
+# variable (repo secret). Authenticated, so it is not rate-limited the way
+# the keyless Google endpoint is, and JA->KO quality is good enough to
+# translate summaries directly (no English pivot). Free tier: 500,000
+# characters/month; this job uses ~2,000/day. Setup: sign up at
+# deepl.com (no card needed), create an API key, add it as a repo secret
+# named DEEPL_API_KEY. The workflow passes it through; when it is absent
+# everything below falls back to Google.
+#
+# Fallback: Google Translate web endpoint (no key needed). It works most
+# days, but Google rate-limits shared/datacenter IPs with HTTP 429, which
+# is what killed the 2026-11-25 run on the very first lucky item (白菜).
+# The fallback therefore retries with exponential backoff and the caller
+# spaces requests out.
 # --------------------------------------------------------------------------
+
+DEEPL_API_URL = "https://api-free.deepl.com/v2/translate"
+
+
+def _sleep_with_jitter(seconds: float) -> None:
+    time.sleep(seconds + random.uniform(0, seconds * 0.25))
+
+
+def deepl_translate(text: str, src: str, tgt: str) -> str:
+    """Translate with the DeepL API (free tier). Raises on any failure."""
+    key = os.environ.get("DEEPL_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("DEEPL_API_KEY is not set")
+    target = {"en": "EN-US"}.get(tgt, tgt.upper())
+    payload = urllib.parse.urlencode(
+        {"text": text, "source_lang": src.upper(), "target_lang": target}
+    )
+    req = urllib.request.Request(
+        DEEPL_API_URL,
+        data=payload.encode("utf-8"),
+        headers={
+            "Authorization": f"DeepL-Auth-Key {key}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        data = json.load(resp)
+    return data["translations"][0]["text"].strip()
+
 
 def google_translate(text: str, src: str, tgt: str) -> str:
     query = urllib.parse.urlencode(
@@ -127,7 +176,9 @@ def google_translate(text: str, src: str, tgt: str) -> str:
     )
     url = "https://translate.googleapis.com/translate_a/single?" + query
     last: Exception | None = None
-    for attempt in range(1, 4):
+    # 5 attempts with ~10s -> ~80s backoff: a 429 usually clears within
+    # minutes, and the workflow timeout (180 min) leaves ample room.
+    for attempt in range(1, 6):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=20) as resp:
@@ -135,12 +186,37 @@ def google_translate(text: str, src: str, tgt: str) -> str:
             return "".join(part[0] for part in data[0] if part[0]).strip()
         except Exception as exc:  # noqa: BLE001 - retry, then surface
             last = exc
-            time.sleep(3 * attempt)
+            if attempt == 5:
+                break
+            wait = 10 * (2 ** (attempt - 1))
+            log(
+                f"translate {src}->{tgt} attempt {attempt}/5 failed "
+                f"({exc}); retrying in ~{wait}s"
+            )
+            _sleep_with_jitter(wait)
     raise RuntimeError(f"translate {src}->{tgt} failed: {text!r}") from last
 
 
+def translate_text(text: str, src: str, tgt: str) -> str:
+    """Translate one text: DeepL when a key is configured, else Google."""
+    if os.environ.get("DEEPL_API_KEY", "").strip():
+        try:
+            return deepl_translate(text, src, tgt)
+        except Exception as exc:  # noqa: BLE001 - fall back to Google
+            log(f"DeepL failed ({exc}); falling back to Google Translate")
+    return google_translate(text, src, tgt)
+
+
 def translate_summary(ja_text: str) -> str:
-    """Japanese horoscope summary -> Korean, via an English pivot."""
+    """Japanese horoscope summary -> Korean.
+
+    With DeepL: direct JA->KO (one call, good quality).
+    Without: Google Translate via an English pivot (JA->EN->KO), because
+    direct JA->KO on Google mangles idioms (e.g. チャンスが舞い込む ->
+    '기회가 춤춘다').
+    """
+    if os.environ.get("DEEPL_API_KEY", "").strip():
+        return translate_text(ja_text, "ja", "ko")
     return google_translate(google_translate(ja_text, "ja", "en"), "en", "ko")
 
 
@@ -332,7 +408,7 @@ def translate_entries(entries: list[dict], glossary: dict) -> list[dict]:
         if lucky:
             log(f"lucky {lucky_ja!r} -> glossary {lucky!r}")
         else:
-            lucky = google_translate(lucky_ja, "ja", "ko")
+            lucky = translate_text(lucky_ja, "ja", "ko")
             log(f"lucky {lucky_ja!r} -> translated {lucky!r}")
         summary = translate_summary(entry["ja_summary"])
         out.append(
@@ -345,7 +421,7 @@ def translate_entries(entries: list[dict], glossary: dict) -> list[dict]:
                 "ja_lucky": lucky_ja,
             }
         )
-        time.sleep(0.4)  # be gentle with the translate endpoint
+        time.sleep(1.0)  # be gentle with the translate endpoint
     return out
 
 
