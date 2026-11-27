@@ -29,10 +29,8 @@ Translation notes (read scripts/README.md for the full story):
   built by aligning the 12 existing human-translated editions with the
   original Japanese, so recurring items keep the site's own wording.
   Unknown items fall back to Google Translate (direct ja -> ko).
-- Summaries are translated with Google Translate via an English pivot
-  (ja -> en -> ko). Direct ja -> ko mangled this colloquial horoscope
-  Japanese ("チャンスが舞い込む" -> "기회가 춤춘다"), while the pivot
-  stays close to the human translations. It is still machine
+- Summaries are also translated with Google Translate, direct ja -> ko
+  (one request per sign, not via English). It is still machine
   translation: the Japanese original is kept in ``ja_summary`` /
   ``ja_lucky`` so any awkward line can be traced and fixed by hand.
 
@@ -47,6 +45,7 @@ import datetime as dt
 import html as htmlmod
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -127,7 +126,8 @@ def google_translate(text: str, src: str, tgt: str) -> str:
     )
     url = "https://translate.googleapis.com/translate_a/single?" + query
     last: Exception | None = None
-    for attempt in range(1, 4):
+    delays = (2, 5, 10, 20)
+    for attempt in range(1, 6):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
             with urllib.request.urlopen(req, timeout=20) as resp:
@@ -135,13 +135,25 @@ def google_translate(text: str, src: str, tgt: str) -> str:
             return "".join(part[0] for part in data[0] if part[0]).strip()
         except Exception as exc:  # noqa: BLE001 - retry, then surface
             last = exc
-            time.sleep(3 * attempt)
+            if attempt >= 5:
+                break
+            code = getattr(exc, "code", None)
+            if code == 429 or (isinstance(code, int) and 500 <= code < 600):
+                delay = delays[min(attempt - 1, len(delays) - 1)]
+                delay += random.uniform(0, 1)
+                log(
+                    f"translate {src}->{tgt} HTTP {code}, "
+                    f"retry in {delay:.1f}s ({attempt}/5)"
+                )
+                time.sleep(delay)
+            else:
+                time.sleep(3 * attempt)
     raise RuntimeError(f"translate {src}->{tgt} failed: {text!r}") from last
 
 
 def translate_summary(ja_text: str) -> str:
-    """Japanese horoscope summary -> Korean, via an English pivot."""
-    return google_translate(google_translate(ja_text, "ja", "en"), "en", "ko")
+    """Japanese horoscope summary -> Korean, direct ja -> ko."""
+    return google_translate(ja_text, "ja", "ko")
 
 
 def load_glossary(root: str) -> dict:
